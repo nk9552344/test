@@ -43,8 +43,8 @@ MOTOR_INDEX = {
 
 DEFAULT_WALKING_CSV = Path("data/go2_lowstate_walking_v2.csv")
 DEFAULT_ENTANGLEMENT_CASES = (
-    (Path("data/go2_lowstate_1781770500.csv"), ("RL",)),
-    (Path("data/go2_lowstate_1781770653.csv"), ("RR",)),
+    (Path("data/go2_lowstate_back_left_leg.csv"), ("RL",)),
+    (Path("data/go2_lowstate_back_right_leg.csv"), ("RR",)),
     (Path("data/go2_lowstate_back_both_leg.csv"), ("RR", "RL")),
     (Path("data/go2_lowstate_front_both_leg.csv"), ("FR", "FL")),
     (Path("data/go2_lowstate_front_left.csv"), ("FL",)),
@@ -60,10 +60,17 @@ DEFAULT_COOLDOWN_SECONDS = 1.0
 DEFAULT_WALKING_LOWER_PERCENTILE = 0.5
 DEFAULT_ENTANGLEMENT_LOWER_PERCENTILE = 5.0
 DEFAULT_THRESHOLD_BLEND = 0.5
+DEFAULT_RELATIVE_BASELINE_SECONDS = 2.0
 
 # CSV foot-force columns are named by leg. Unitree message ordering can vary by
 # SDK/bridge, so keep it configurable; this order matches the existing scripts.
 DEFAULT_FOOT_FORCE_ORDER = ("FL", "FR", "RL", "RR")
+OPPOSITE_LEG = {
+    "FR": "FL",
+    "FL": "FR",
+    "RR": "RL",
+    "RL": "RR",
+}
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,8 @@ class TorqueSample:
     timestamp: float
     thigh_tau: float
     thigh_dq: float
+    torque_abs_sum: float
+    dq_abs_mean: float
     foot_force: float
 
 
@@ -104,6 +113,18 @@ class LegModel:
     calibration_min_tau: float
     calibration_max_tau: float
     torque_scale: float
+    effort_threshold: float
+    effort_scale: float
+    walking_upper_effort: float
+    entanglement_upper_effort: float | None
+    stalled_effort_threshold: float
+    stalled_effort_scale: float
+    walking_upper_stalled_effort: float
+    entanglement_upper_stalled_effort: float | None
+    relative_tau_threshold: float
+    relative_tau_scale: float
+    walking_upper_relative_tau: float
+    entanglement_upper_relative_tau: float | None
 
 
 @dataclass(frozen=True)
@@ -281,11 +302,17 @@ def read_csv_samples(csv_path: Path) -> tuple[dict[str, list[TorqueSample]], flo
             foot_col = f"foot_{leg}"
             if tau_col not in data.columns or dq_col not in data.columns:
                 continue
+            tau_cols = [f"{leg}_{joint}_tau" for joint in JOINT_ORDER if f"{leg}_{joint}_tau" in data.columns]
+            dq_cols = [f"{leg}_{joint}_dq" for joint in JOINT_ORDER if f"{leg}_{joint}_dq" in data.columns]
+            torque_abs_sum = sum(abs(safe_float(row.get(column))) for column in tau_cols) if tau_cols else abs(safe_float(row.get(tau_col)))
+            dq_abs_mean = fmean(abs(safe_float(row.get(column))) for column in dq_cols) if dq_cols else abs(safe_float(row.get(dq_col)))
             samples_by_leg[leg].append(
                 TorqueSample(
                     timestamp=timestamp,
                     thigh_tau=safe_float(row.get(tau_col)),
                     thigh_dq=safe_float(row.get(dq_col)),
+                    torque_abs_sum=torque_abs_sum,
+                    dq_abs_mean=dq_abs_mean,
                     foot_force=safe_float(row.get(foot_col)),
                 )
             )
@@ -304,6 +331,23 @@ def rolling_windows(samples: list[TorqueSample], window_seconds: float) -> list[
         if features is not None:
             windows.append(features)
     return windows
+
+
+def relative_tau_changes(samples: list[TorqueSample], polarity: str, baseline_seconds: float = DEFAULT_RELATIVE_BASELINE_SECONDS) -> list[float]:
+    history: Deque[TorqueSample] = deque()
+    changes: list[float] = []
+    for sample in samples:
+        history.append(sample)
+        cutoff = sample.timestamp - baseline_seconds
+        while history and history[0].timestamp < cutoff:
+            history.popleft()
+        if polarity == "down":
+            reference = max(history_sample.thigh_tau for history_sample in history)
+            changes.append(max(0.0, reference - sample.thigh_tau))
+        else:
+            reference = min(history_sample.thigh_tau for history_sample in history)
+            changes.append(max(0.0, sample.thigh_tau - reference))
+    return changes
 
 
 def parse_entanglement_cases(raw_cases: list[str] | None) -> tuple[tuple[Path, tuple[str, ...]], ...]:
@@ -337,12 +381,36 @@ def calibrate_models(
 ) -> dict[str, LegModel]:
     walking_samples, _ = read_csv_samples(walking_csv)
     entanglement_tau_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    entanglement_effort_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    entanglement_stalled_effort_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    entanglement_relative_down_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    entanglement_relative_up_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    non_entanglement_tau_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    non_entanglement_effort_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    non_entanglement_stalled_effort_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    non_entanglement_relative_down_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
+    non_entanglement_relative_up_by_leg: dict[str, list[float]] = {leg: [] for leg in LEG_ORDER}
     for csv_path, label_legs in entanglement_cases:
         if not csv_path.exists():
             continue
         case_samples, _ = read_csv_samples(csv_path)
+        label_set = set(label_legs)
         for label_leg in label_legs:
-            entanglement_tau_by_leg[label_leg].extend(sample.thigh_tau for sample in case_samples.get(label_leg, []))
+            label_samples = case_samples.get(label_leg, [])
+            entanglement_tau_by_leg[label_leg].extend(sample.thigh_tau for sample in label_samples)
+            entanglement_effort_by_leg[label_leg].extend(sample.torque_abs_sum for sample in label_samples)
+            entanglement_stalled_effort_by_leg[label_leg].extend(sample.torque_abs_sum / (sample.dq_abs_mean + 0.05) for sample in label_samples)
+            entanglement_relative_down_by_leg[label_leg].extend(relative_tau_changes(label_samples, "down"))
+            entanglement_relative_up_by_leg[label_leg].extend(relative_tau_changes(label_samples, "up"))
+        for label_leg in label_legs:
+            opposite_leg = OPPOSITE_LEG[label_leg]
+            if opposite_leg not in label_set:
+                opposite_samples = case_samples.get(opposite_leg, [])
+                non_entanglement_tau_by_leg[opposite_leg].extend(sample.thigh_tau for sample in opposite_samples)
+                non_entanglement_effort_by_leg[opposite_leg].extend(sample.torque_abs_sum for sample in opposite_samples)
+                non_entanglement_stalled_effort_by_leg[opposite_leg].extend(sample.torque_abs_sum / (sample.dq_abs_mean + 0.05) for sample in opposite_samples)
+                non_entanglement_relative_down_by_leg[opposite_leg].extend(relative_tau_changes(opposite_samples, "down"))
+                non_entanglement_relative_up_by_leg[opposite_leg].extend(relative_tau_changes(opposite_samples, "up"))
 
     models: dict[str, LegModel] = {}
     blend = max(0.0, min(1.0, threshold_blend))
@@ -351,37 +419,85 @@ def calibrate_models(
         if not calibration_samples:
             raise ValueError(f"No usable walking windows for {leg}; check {walking_csv}")
         walking_tau = [sample.thigh_tau for sample in calibration_samples]
+        walking_effort = [sample.torque_abs_sum for sample in calibration_samples]
+        walking_stalled_effort = [sample.torque_abs_sum / (sample.dq_abs_mean + 0.05) for sample in calibration_samples]
         polarity = (polarity_by_leg or {}).get(leg, default_polarity(leg))
         if polarity not in ("down", "up"):
             raise ValueError(f"Invalid polarity for {leg}: {polarity!r}")
+        walking_relative_tau = relative_tau_changes(calibration_samples, polarity)
         walking_lower = percentile(walking_tau, walking_lower_percentile)
         walking_upper = percentile(walking_tau, 100.0 - walking_lower_percentile)
+        negative_tau = walking_tau + non_entanglement_tau_by_leg[leg]
+        negative_lower = percentile(negative_tau, walking_lower_percentile)
+        negative_upper = percentile(negative_tau, 100.0 - walking_lower_percentile)
+        negative_effort = walking_effort + non_entanglement_effort_by_leg[leg]
+        walking_upper_effort = percentile(walking_effort, 100.0 - walking_lower_percentile)
+        negative_upper_effort = percentile(negative_effort, 100.0 - walking_lower_percentile)
+        negative_stalled_effort = walking_stalled_effort + non_entanglement_stalled_effort_by_leg[leg]
+        walking_upper_stalled_effort = percentile(walking_stalled_effort, 100.0 - walking_lower_percentile)
+        negative_upper_stalled_effort = percentile(negative_stalled_effort, 100.0 - walking_lower_percentile)
+        non_entanglement_relative_tau = non_entanglement_relative_down_by_leg[leg] if polarity == "down" else non_entanglement_relative_up_by_leg[leg]
+        negative_relative_tau = walking_relative_tau + non_entanglement_relative_tau
+        walking_upper_relative_tau = percentile(walking_relative_tau, 100.0 - walking_lower_percentile)
+        negative_upper_relative_tau = percentile(negative_relative_tau, 100.0 - walking_lower_percentile)
         entanglement_lower = None
         if entanglement_tau_by_leg[leg]:
             entanglement_lower = percentile(
                 entanglement_tau_by_leg[leg],
                 entanglement_lower_percentile if polarity == "down" else 100.0 - entanglement_lower_percentile,
             )
+        entanglement_upper_effort = None
+        if entanglement_effort_by_leg[leg]:
+            entanglement_upper_effort = percentile(entanglement_effort_by_leg[leg], 100.0 - entanglement_lower_percentile)
+        entanglement_upper_stalled_effort = None
+        if entanglement_stalled_effort_by_leg[leg]:
+            entanglement_upper_stalled_effort = percentile(entanglement_stalled_effort_by_leg[leg], 100.0 - entanglement_lower_percentile)
+        entanglement_relative_tau = entanglement_relative_down_by_leg[leg] if polarity == "down" else entanglement_relative_up_by_leg[leg]
+        entanglement_upper_relative_tau = None
+        if entanglement_relative_tau:
+            entanglement_upper_relative_tau = percentile(entanglement_relative_tau, 100.0 - entanglement_lower_percentile)
 
         walking_stats = robust_stats(walking_tau)
-        if polarity == "down" and entanglement_lower is not None and entanglement_lower < walking_lower:
-            torque_threshold = entanglement_lower * (1.0 - blend) + walking_lower * blend
-        elif polarity == "up" and entanglement_lower is not None and entanglement_lower > walking_upper:
-            torque_threshold = entanglement_lower * (1.0 - blend) + walking_upper * blend
+        effort_stats = robust_stats(walking_effort)
+        stalled_effort_stats = robust_stats(walking_stalled_effort)
+        relative_tau_stats = robust_stats(walking_relative_tau)
+        negative_guard = min(walking_lower, negative_lower) if polarity == "down" else max(walking_upper, negative_upper)
+        if polarity == "down" and entanglement_lower is not None and entanglement_lower < negative_guard:
+            torque_threshold = entanglement_lower * (1.0 - blend) + negative_guard * blend
+        elif polarity == "up" and entanglement_lower is not None and entanglement_lower > negative_guard:
+            torque_threshold = entanglement_lower * (1.0 - blend) + negative_guard * blend
         else:
-            torque_threshold = walking_lower - 2.5 * walking_stats.scale if polarity == "down" else walking_upper + 2.5 * walking_stats.scale
+            torque_threshold = negative_guard - 2.5 * walking_stats.scale if polarity == "down" else negative_guard + 2.5 * walking_stats.scale
+        effort_guard = max(walking_upper_effort, negative_upper_effort)
+        if entanglement_upper_effort is not None and entanglement_upper_effort > effort_guard:
+            effort_threshold = entanglement_upper_effort * (1.0 - blend) + effort_guard * blend
+        else:
+            effort_threshold = effort_guard + 2.5 * effort_stats.scale
+        stalled_effort_guard = max(walking_upper_stalled_effort, negative_upper_stalled_effort)
+        if entanglement_upper_stalled_effort is not None and entanglement_upper_stalled_effort > stalled_effort_guard:
+            stalled_effort_threshold = entanglement_upper_stalled_effort * (1.0 - blend) + stalled_effort_guard * blend
+        else:
+            stalled_effort_threshold = stalled_effort_guard + 2.5 * stalled_effort_stats.scale
+        relative_tau_guard = max(walking_upper_relative_tau, negative_upper_relative_tau)
+        if entanglement_upper_relative_tau is not None and entanglement_upper_relative_tau > relative_tau_guard:
+            relative_tau_threshold = entanglement_upper_relative_tau * (1.0 - blend) + relative_tau_guard * blend
+        else:
+            relative_tau_threshold = relative_tau_guard + 2.5 * relative_tau_stats.scale
 
         dummy_stats = {
-            "abs_mean": robust_stats(walking_tau),
-            "abs_max": robust_stats(walking_tau),
-            "rms": robust_stats(walking_tau),
+            "abs_mean": walking_stats,
+            "abs_max": walking_stats,
+            "rms": walking_stats,
             "peak_to_peak": FeatureStats(median=0.0, scale=1.0),
             "slope_abs_mean": FeatureStats(median=0.0, scale=1.0),
             "low_dq": FeatureStats(median=0.0, scale=1.0),
             "foot_mean": FeatureStats(median=0.0, scale=1.0),
         }
-        walking_guard = walking_lower if polarity == "down" else walking_upper
+        walking_guard = negative_guard
         torque_scale = max(abs(walking_guard - torque_threshold), walking_stats.scale, 1e-6)
+        effort_scale = max(abs(effort_threshold - effort_guard), effort_stats.scale, 1e-6)
+        stalled_effort_scale = max(abs(stalled_effort_threshold - stalled_effort_guard), stalled_effort_stats.scale, 1e-6)
+        relative_tau_scale = max(abs(relative_tau_threshold - relative_tau_guard), relative_tau_stats.scale, 1e-6)
         models[leg] = LegModel(
             feature_stats=dummy_stats,
             threshold=torque_threshold,
@@ -394,6 +510,18 @@ def calibrate_models(
             calibration_min_tau=min(walking_tau),
             calibration_max_tau=max(walking_tau),
             torque_scale=torque_scale,
+            effort_threshold=effort_threshold,
+            effort_scale=effort_scale,
+            walking_upper_effort=walking_upper_effort,
+            entanglement_upper_effort=entanglement_upper_effort,
+            stalled_effort_threshold=stalled_effort_threshold,
+            stalled_effort_scale=stalled_effort_scale,
+            walking_upper_stalled_effort=walking_upper_stalled_effort,
+            entanglement_upper_stalled_effort=entanglement_upper_stalled_effort,
+            relative_tau_threshold=relative_tau_threshold,
+            relative_tau_scale=relative_tau_scale,
+            walking_upper_relative_tau=walking_upper_relative_tau,
+            entanglement_upper_relative_tau=entanglement_upper_relative_tau,
         )
 
     return models
@@ -411,6 +539,18 @@ def model_to_json(model: LegModel) -> dict[str, Any]:
         "calibration_min_tau": model.calibration_min_tau,
         "calibration_max_tau": model.calibration_max_tau,
         "torque_scale": model.torque_scale,
+        "effort_threshold": model.effort_threshold,
+        "effort_scale": model.effort_scale,
+        "walking_upper_effort": model.walking_upper_effort,
+        "entanglement_upper_effort": model.entanglement_upper_effort,
+        "stalled_effort_threshold": model.stalled_effort_threshold,
+        "stalled_effort_scale": model.stalled_effort_scale,
+        "walking_upper_stalled_effort": model.walking_upper_stalled_effort,
+        "entanglement_upper_stalled_effort": model.entanglement_upper_stalled_effort,
+        "relative_tau_threshold": model.relative_tau_threshold,
+        "relative_tau_scale": model.relative_tau_scale,
+        "walking_upper_relative_tau": model.walking_upper_relative_tau,
+        "entanglement_upper_relative_tau": model.entanglement_upper_relative_tau,
     }
 
 
@@ -465,6 +605,18 @@ def load_model_config(config_path: Path) -> tuple[dict[str, LegModel], dict[str,
             calibration_min_tau=safe_float(raw.get("calibration_min_tau")),
             calibration_max_tau=safe_float(raw.get("calibration_max_tau")),
             torque_scale=max(safe_float(raw.get("torque_scale"), 1.0), 1e-6),
+            effort_threshold=safe_float(raw.get("effort_threshold"), 1e18),
+            effort_scale=max(safe_float(raw.get("effort_scale"), 1.0), 1e-6),
+            walking_upper_effort=safe_float(raw.get("walking_upper_effort")),
+            entanglement_upper_effort=raw.get("entanglement_upper_effort"),
+            stalled_effort_threshold=safe_float(raw.get("stalled_effort_threshold"), 1e18),
+            stalled_effort_scale=max(safe_float(raw.get("stalled_effort_scale"), 1.0), 1e-6),
+            walking_upper_stalled_effort=safe_float(raw.get("walking_upper_stalled_effort")),
+            entanglement_upper_stalled_effort=raw.get("entanglement_upper_stalled_effort"),
+            relative_tau_threshold=safe_float(raw.get("relative_tau_threshold"), 1e18),
+            relative_tau_scale=max(safe_float(raw.get("relative_tau_scale"), 1.0), 1e-6),
+            walking_upper_relative_tau=safe_float(raw.get("walking_upper_relative_tau")),
+            entanglement_upper_relative_tau=raw.get("entanglement_upper_relative_tau"),
         )
     return models, payload
 
@@ -482,6 +634,7 @@ class ThighTorqueDetector:
         self.persistence_seconds = persistence_seconds
         self.required_window_fraction = required_window_fraction
         self.history: dict[str, Deque[TorqueSample]] = {leg: deque() for leg in LEG_ORDER}
+        self.baseline_history: dict[str, Deque[TorqueSample]] = {leg: deque() for leg in LEG_ORDER}
         self.streaks: dict[str, int] = {leg: 0 for leg in LEG_ORDER}
         self.last_alarm_leg: str | None = None
 
@@ -489,22 +642,27 @@ class ThighTorqueDetector:
         timestamp = max((sample.timestamp for sample in samples_by_leg.values()), default=0.0)
         for leg, sample in samples_by_leg.items():
             self.history[leg].append(sample)
+            self.baseline_history[leg].append(sample)
 
         cutoff = timestamp - self.window_seconds
+        baseline_cutoff = timestamp - max(DEFAULT_RELATIVE_BASELINE_SECONDS, self.window_seconds)
         for leg in LEG_ORDER:
             while self.history[leg] and self.history[leg][0].timestamp < cutoff:
                 self.history[leg].popleft()
+            while self.baseline_history[leg] and self.baseline_history[leg][0].timestamp < baseline_cutoff:
+                self.baseline_history[leg].popleft()
 
         scores: dict[str, float] = {}
         persistent_seconds: dict[str, float] = {}
         window_fractions: dict[str, float] = {}
         for leg in LEG_ORDER:
             samples = list(self.history[leg])
+            baseline_samples = list(self.baseline_history[leg])
             model = self.models[leg]
             threshold = model.torque_threshold
-            exceed_samples = [sample for sample in samples if self._is_exceedance(sample.thigh_tau, model)]
+            exceed_samples = [sample for sample in samples if self._is_any_exceedance(sample, model, baseline_samples)]
             window_fractions[leg] = len(exceed_samples) / len(samples) if samples else 0.0
-            persistent_seconds[leg] = self._latest_continuous_exceedance_seconds(samples, model)
+            persistent_seconds[leg] = self._latest_continuous_exceedance_seconds(samples, model, baseline_samples)
             if not samples:
                 scores[leg] = 0.0
             else:
@@ -514,7 +672,16 @@ class ThighTorqueDetector:
                 else:
                     extreme_tau = max(sample.thigh_tau for sample in samples)
                     level_margin = extreme_tau - threshold
-                score_from_level = 1.0 + max(0.0, level_margin) / model.torque_scale
+                thigh_score_from_level = 1.0 + max(0.0, level_margin) / model.torque_scale
+                extreme_effort = max(sample.torque_abs_sum for sample in samples)
+                effort_margin = extreme_effort - model.effort_threshold
+                effort_score_from_level = 1.0 + max(0.0, effort_margin) / model.effort_scale
+                extreme_stalled_effort = max(sample.torque_abs_sum / (sample.dq_abs_mean + 0.05) for sample in samples)
+                stalled_effort_margin = extreme_stalled_effort - model.stalled_effort_threshold
+                stalled_effort_score_from_level = 1.0 + max(0.0, stalled_effort_margin) / model.stalled_effort_scale
+                relative_margin = self._relative_tau_margin(samples, baseline_samples, model)
+                relative_tau_score_from_level = 1.0 + max(0.0, relative_margin) / model.relative_tau_scale
+                score_from_level = max(thigh_score_from_level, effort_score_from_level, stalled_effort_score_from_level, relative_tau_score_from_level)
                 score_from_fraction = window_fractions[leg] / max(self.required_window_fraction, 1e-6)
                 score_from_persistence = persistent_seconds[leg] / max(self.persistence_seconds, 1e-6)
                 scores[leg] = min(score_from_level, score_from_fraction, score_from_persistence)
@@ -546,15 +713,51 @@ class ThighTorqueDetector:
             return thigh_tau <= model.torque_threshold
         return thigh_tau >= model.torque_threshold
 
-    def _latest_continuous_exceedance_seconds(self, samples: list[TorqueSample], model: LegModel) -> float:
+    @staticmethod
+    def _is_effort_exceedance(sample: TorqueSample, model: LegModel) -> bool:
+        return sample.torque_abs_sum >= model.effort_threshold
+
+    @staticmethod
+    def _is_stalled_effort_exceedance(sample: TorqueSample, model: LegModel) -> bool:
+        return sample.torque_abs_sum / (sample.dq_abs_mean + 0.05) >= model.stalled_effort_threshold
+
+    def _is_relative_tau_exceedance(self, sample: TorqueSample, baseline_samples: list[TorqueSample], model: LegModel) -> bool:
+        if not baseline_samples:
+            return False
+        if model.polarity == "down":
+            reference = max(baseline_sample.thigh_tau for baseline_sample in baseline_samples)
+            return reference - sample.thigh_tau >= model.relative_tau_threshold
+        reference = min(baseline_sample.thigh_tau for baseline_sample in baseline_samples)
+        return sample.thigh_tau - reference >= model.relative_tau_threshold
+
+    def _relative_tau_margin(self, samples: list[TorqueSample], baseline_samples: list[TorqueSample], model: LegModel) -> float:
+        if not samples or not baseline_samples:
+            return -model.relative_tau_threshold
+        if model.polarity == "down":
+            reference = max(baseline_sample.thigh_tau for baseline_sample in baseline_samples)
+            extreme = min(sample.thigh_tau for sample in samples)
+            return reference - extreme - model.relative_tau_threshold
+        reference = min(baseline_sample.thigh_tau for baseline_sample in baseline_samples)
+        extreme = max(sample.thigh_tau for sample in samples)
+        return extreme - reference - model.relative_tau_threshold
+
+    def _is_any_exceedance(self, sample: TorqueSample, model: LegModel, baseline_samples: list[TorqueSample]) -> bool:
+        return (
+            self._is_exceedance(sample.thigh_tau, model)
+            or self._is_effort_exceedance(sample, model)
+            or self._is_stalled_effort_exceedance(sample, model)
+            or self._is_relative_tau_exceedance(sample, baseline_samples, model)
+        )
+
+    def _latest_continuous_exceedance_seconds(self, samples: list[TorqueSample], model: LegModel, baseline_samples: list[TorqueSample]) -> float:
         if len(samples) < 2:
             return 0.0
         latest = samples[-1]
-        if not self._is_exceedance(latest.thigh_tau, model):
+        if not self._is_any_exceedance(latest, model, baseline_samples):
             return 0.0
         start = latest.timestamp
         for sample in reversed(samples[:-1]):
-            if not self._is_exceedance(sample.thigh_tau, model):
+            if not self._is_any_exceedance(sample, model, baseline_samples):
                 break
             start = sample.timestamp
         return max(0.0, latest.timestamp - start)
@@ -638,10 +841,15 @@ def extract_live_samples(msg: Any, timestamp: float, foot_order: tuple[str, ...]
     samples: dict[str, TorqueSample] = {}
     for leg, joint_indices in MOTOR_INDEX.items():
         thigh = motor_state[joint_indices["thigh"]]
+        joint_states = [motor_state[joint_indices[joint]] for joint in JOINT_ORDER]
+        torque_abs_sum = sum(abs(safe_float(getattr(joint_state, "tau_est", getattr(joint_state, "tau", 0.0)))) for joint_state in joint_states)
+        dq_abs_mean = fmean(abs(safe_float(getattr(joint_state, "dq", 0.0))) for joint_state in joint_states)
         samples[leg] = TorqueSample(
             timestamp=timestamp,
             thigh_tau=safe_float(getattr(thigh, "tau_est", getattr(thigh, "tau", 0.0))),
             thigh_dq=safe_float(getattr(thigh, "dq", 0.0)),
+            torque_abs_sum=torque_abs_sum,
+            dq_abs_mean=dq_abs_mean,
             foot_force=foot_by_leg.get(leg, 0.0),
         )
     return samples
