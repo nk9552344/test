@@ -66,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "csv_path",
         nargs="?",
-        default=Path("data/go2_lowstate_front_both_leg.csv"),
+        default=Path("data/go2_lowstate_stops.csv"),
         type=Path,
         help="Path to the CSV file. Defaults to data/go2_lowstate_walking.csv.",
     )
